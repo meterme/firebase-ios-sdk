@@ -37,11 +37,16 @@
     /// Presents an URL to interact with user.
     /// - Parameter url: The URL to present.
     /// - Parameter uiDelegate: The UI delegate to present view controller.
+    /// - Parameter callbackScheme: The app's custom URL scheme that the identity provider
+    /// redirects back to. meter.me change (MM-8209): the iOS implementation runs an
+    /// `ASWebAuthenticationSession`, which resolves the callback itself and so has to be told
+    /// the scheme. Pass the empty string when the app has none.
     /// - Parameter completion: A block to be called either synchronously if the presentation fails
     /// to start, or asynchronously in future on an unspecified thread once the presentation
     /// finishes.
     func present(_ url: URL,
                  uiDelegate: AuthUIDelegate?,
+                 callbackScheme: String,
                  callbackMatcher: @escaping (URL?) -> Bool,
                  completion: @escaping (URL?, Error?) -> Void)
   }
