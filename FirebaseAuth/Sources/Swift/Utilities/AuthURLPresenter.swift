@@ -87,11 +87,20 @@
           // window anchor. The uiDelegate is therefore BYPASSED on this path, for both
           // presentation and dismissal, and a caller-supplied uiDelegate has no effect here.
           // It still presents and dismisses the macCatalyst WKWebView path above.
+          //
+          // Upstream's SFSafariViewController delegate callback checked `controller ==
+          // self.safariViewController`, so a callback belonging to a FINISHED presentation
+          // could not end a later one. finishPresentation calls cancel() below, which invokes
+          // this handler asynchronously, so that identity check is kept rather than a bare
+          // "is any session active" test. The session is held in a weak local, captured by
+          // the closure and assigned immediately after it, because capturing the session
+          // strongly inside its own completion handler would retain it forever.
+          weak var presentedSession: ASWebAuthenticationSession?
           let session = ASWebAuthenticationSession(url: url, callbackURLScheme: nil) {
             [weak self] _, _ in
-            guard let self else { return }
+            guard let self, let presentedSession else { return }
             kAuthGlobalWorkQueue.async {
-              guard self.authSession != nil else { return }
+              guard self.authSession === presentedSession else { return }
               self.authSession = nil
               self.finishPresentation(
                 withURL: nil,
@@ -99,6 +108,7 @@
               )
             }
           }
+          presentedSession = session
           session.prefersEphemeralWebBrowserSession = true
           session.presentationContextProvider = self
           self.authSession = session
