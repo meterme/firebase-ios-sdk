@@ -14,14 +14,14 @@
 
 #if os(iOS)
 
+  import AuthenticationServices
   import Foundation
-  import SafariServices
   import UIKit
   import WebKit
 
-  /// A Class responsible for presenting URL via SFSafariViewController or WKWebView.
+  /// A Class responsible for presenting URL via ASWebAuthenticationSession or WKWebView.
   class AuthURLPresenter: NSObject,
-    SFSafariViewControllerDelegate, AuthWebViewControllerDelegate {
+    AuthWebViewControllerDelegate, ASWebAuthenticationPresentationContextProviding {
     /// Presents an URL to interact with user.
     /// - Parameter url: The URL to present.
     /// - Parameter uiDelegate: The UI delegate to present view controller.
@@ -58,13 +58,59 @@
             }
           }
         #else
-          self.safariViewController = SFSafariViewController(url: url)
-          self.safariViewController?.delegate = self
-          if let safariViewController = self.safariViewController {
-            if let fakeUIDelegate = self.fakeUIDelegate {
-              fakeUIDelegate.present(safariViewController, animated: true)
-            } else {
-              self.uiDelegate?.present(safariViewController, animated: true)
+          // meter.me change against upstream 12.19.1. Upstream presents this URL in an
+          // SFSafariViewController. Measured on a physical iPhone 16e, iOS 26.6.2, with
+          // Safari's "Prevent Cross-Site Tracking" on, which is the default: the FIRST
+          // presentation after each app launch returns from the identity provider to
+          // Firebase's hosted handler page showing "Unable to process request due to
+          // missing initial state", because the handler cannot read back the descriptor
+          // it wrote to sessionStorage on the outbound leg. The second attempt in the same
+          // app launch succeeds, and with the setting off the first attempt succeeds.
+          // Upstream issue: https://github.com/firebase/firebase-ios-sdk/issues/16277.
+          //
+          // ASWebAuthenticationSession with prefersEphemeralWebBrowserSession asks the
+          // browser not to share cookies or other browsing data with the normal Safari
+          // session, which is the one lever that reaches the storage the handler loses.
+          // The flag has no effect unless it is set before start(), and start() runs here
+          // on the main thread. Ephemeral mode also suppresses the consent alert the class
+          // otherwise shows, because there is no existing browser session to share.
+          //
+          // Callback delivery is UNCHANGED. callbackURLScheme is nil, so this session never
+          // resolves a callback URL of its own: the identity provider's redirect reaches the
+          // app through its own URL scheme and Auth.canHandle(_:), exactly as upstream. A
+          // completion handler call therefore always means the flow ended WITHOUT a callback,
+          // so every completion error, ASWebAuthenticationSessionError.canceledLogin included,
+          // maps to the same webContextCancelledError the SFSafariViewController "Done"
+          // button produced upstream.
+          //
+          // ASWebAuthenticationSession has no view controller: it presents itself from a
+          // window anchor. The uiDelegate is therefore BYPASSED on this path, for both
+          // presentation and dismissal, and a caller-supplied uiDelegate has no effect here.
+          // It still presents and dismisses the macCatalyst WKWebView path above.
+          let session = ASWebAuthenticationSession(url: url, callbackURLScheme: nil) {
+            [weak self] _, _ in
+            guard let self else { return }
+            kAuthGlobalWorkQueue.async {
+              guard self.authSession != nil else { return }
+              self.authSession = nil
+              self.finishPresentation(
+                withURL: nil,
+                error: AuthErrorUtils.webContextCancelledError(message: nil)
+              )
+            }
+          }
+          session.prefersEphemeralWebBrowserSession = true
+          session.presentationContextProvider = self
+          self.authSession = session
+          if !session.start() {
+            // start() returning false does not call the completion handler, so the caller
+            // would otherwise wait forever.
+            self.authSession = nil
+            kAuthGlobalWorkQueue.async {
+              self.finishPresentation(
+                withURL: nil,
+                error: AuthErrorUtils.webContextCancelledError(message: nil)
+              )
             }
           }
         #endif
@@ -84,18 +130,27 @@
       return false
     }
 
-    // MARK: SFSafariViewControllerDelegate
+    // MARK: ASWebAuthenticationPresentationContextProviding
 
-    func safariViewControllerDidFinish(_ controller: SFSafariViewController) {
-      kAuthGlobalWorkQueue.async {
-        if controller == self.safariViewController {
-          self.safariViewController = nil
-          // TODO: Ensure that the SFSafariViewController is actually removed from the screen
-          // before invoking finishPresentation
-          self.finishPresentation(withURL: nil,
-                                  error: AuthErrorUtils.webContextCancelledError(message: nil))
+    @MainActor
+    func presentationAnchor(for session: ASWebAuthenticationSession) -> ASPresentationAnchor {
+      // The SDK has no key window helper. AuthDefaultUIDelegate walks the same scenes but
+      // returns a view controller, and it reaches UIApplication through a selector so that
+      // the file still compiles for app extensions. Both are repeated here because
+      // ASWebAuthenticationSession needs a window and not a view controller.
+      let sel = NSSelectorFromString("sharedApplication")
+      guard UIApplication.responds(to: sel),
+            let rawApplication = UIApplication.perform(sel),
+            let application = rawApplication.takeUnretainedValue() as? UIApplication else {
+        return ASPresentationAnchor()
+      }
+      for scene in application.connectedScenes {
+        guard let windowScene = scene as? UIWindowScene else { continue }
+        for window in windowScene.windows where window.isKeyWindow {
+          return window
         }
       }
+      return ASPresentationAnchor()
     }
 
     // MARK: AuthWebViewControllerDelegate
@@ -137,13 +192,14 @@
     /// The callback URL matcher for the current presentation, if one is active.
     private var callbackMatcher: ((URL) -> Bool)?
 
-    /// The SFSafariViewController used for the current presentation, if any.
-    private var safariViewController: SFSafariViewController?
+    /// The `ASWebAuthenticationSession` used for the current presentation, if any.
+    private var authSession: ASWebAuthenticationSession?
 
     /// The `AuthWebViewController` used for the current presentation, if any.
     private var webViewController: AuthWebViewController?
 
-    /// The UIDelegate used to present the SFSafariViewController.
+    /// The UIDelegate used to present the macCatalyst web view. It is NOT used on iOS, where
+    /// ASWebAuthenticationSession presents itself from a window anchor.
     var uiDelegate: AuthUIDelegate?
 
     /// The completion handler for the current presentation, if one is active.
@@ -165,11 +221,22 @@
       self.uiDelegate = nil
       let completion = self.completion
       self.completion = nil
-      let safariViewController = self.safariViewController
-      self.safariViewController = nil
+      let authSession = self.authSession
+      self.authSession = nil
       let webViewController = self.webViewController
       self.webViewController = nil
-      if safariViewController != nil || webViewController != nil {
+      if let authSession {
+        // The session is still on screen. This is the success path: canHandle(url:) matched
+        // the callback the app received through its own URL scheme, and cancel() is what
+        // dismisses an ASWebAuthenticationSession.
+        DispatchQueue.main.async {
+          authSession.cancel()
+          self.isPresenting = false
+          if let completion {
+            completion(url, error)
+          }
+        }
+      } else if webViewController != nil {
         DispatchQueue.main.async {
           uiDelegate?.dismiss(animated: true) {
             self.isPresenting = false
