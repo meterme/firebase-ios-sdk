@@ -556,8 +556,13 @@ import Foundation
       }
 
       return try await withUnsafeThrowingContinuation { continuation in
+        // meter.me change (MM-8209): the presenter runs an ASWebAuthenticationSession, which
+        // resolves the callback itself and has to be told the scheme. This property is the
+        // empty string when the app carries neither a client id nor a googleAppID, and the
+        // presenter passes nil in that case.
         self.auth.authURLPresenter.present(url,
                                            uiDelegate: uiDelegate,
+                                           callbackScheme: self.callbackScheme,
                                            callbackMatcher: callbackMatcher) { callbackURL, error in
           if let error {
             continuation.resume(throwing: error)

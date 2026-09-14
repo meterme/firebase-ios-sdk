@@ -265,8 +265,11 @@ import Foundation
                                                  authType: "signInWithRedirect",
                                                  callbackScheme: self.callbackScheme)
             }
+            // meter.me change (MM-8209): the presenter runs an ASWebAuthenticationSession,
+            // which resolves the callback itself and has to be told the scheme.
             self.auth.authURLPresenter.present(headfulLiteURL,
                                                uiDelegate: uiDelegate,
+                                               callbackScheme: self.callbackScheme,
                                                callbackMatcher: callbackMatcher) { callbackURL, error in
               if let error {
                 callbackOnMainThread(nil, error)
